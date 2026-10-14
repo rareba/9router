@@ -15,6 +15,12 @@ vi.mock("../../open-sse/utils/proxyFetch.js", () => ({ proxyAwareFetch: vi.fn() 
 import { VertexExecutor } from "../../open-sse/executors/vertex.js";
 
 describe("Vertex API-key locations", () => {
+  it("keeps an effort suffix out of Google's model URL", () => {
+    const url = new VertexExecutor().buildUrl("gemini-4-argon(high)", true, 0, {
+      apiKey: "test-key", providerSpecificData: { projectId: "test-project", location: "global" },
+    });
+    expect(new URL(url).pathname).toBe("/v1/projects/test-project/locations/global/publishers/google/models/gemini-4-argon:streamGenerateContent");
+  });
   it.each([false, true])("uses the configured global location (stream=%s)", (stream) => {
     const executor = new VertexExecutor();
     const url = new URL(executor.buildUrl("gemini-4-argon", stream, 0, {

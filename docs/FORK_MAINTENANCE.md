@@ -7,6 +7,8 @@ For a fresh clone of `rareba/9router`, configure the original repository once:
 
 ```sh
 git remote add upstream https://github.com/decolua/9router.git
+git config pull.rebase false
+git config pull.ff false
 ```
 
 Start with a clean working tree, then merge and check upstream updates:

@@ -262,6 +262,16 @@ export async function handleNonStreamingResponse({ providerResponse, provider, m
   // provider opts in via transport.quirks.clineEnvelope.
   responseBody = unwrapClineEnvelope(responseBody, provider);
 
+  if (responseBody?.error) {
+    const upstreamStatus = Number(responseBody.error.status);
+    const status = Number.isInteger(upstreamStatus) && upstreamStatus >= 400 && upstreamStatus <= 599 ? upstreamStatus : HTTP_STATUS.BAD_GATEWAY;
+    const until = Number(responseBody.error.retry_at);
+    const retryAt = Number.isFinite(until) && until > Date.now() && until <= Date.now() + 86400000 ? until : undefined;
+    appendLog({ status: `FAILED ${status}` });
+    return createErrorResult(status, typeof responseBody.error.message === 'string' ? responseBody.error.message : 'Upstream response failed', retryAt,
+      retryAt ? { 'retry-after': String(Math.ceil((retryAt - Date.now()) / 1000)) } : null);
+  }
+
   reqLogger.logProviderResponse(providerResponse.status, providerResponse.statusText, providerResponse.headers, responseBody);
   if (onRequestSuccess) {
     Promise.resolve()

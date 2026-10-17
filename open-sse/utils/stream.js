@@ -2,7 +2,7 @@ import { translateResponse, initState } from "../translator/index.js";
 import { FORMATS } from "../translator/formats.js";
 import { trackPendingRequest, appendRequestLog } from "@/lib/usageDb.js";
 import { extractUsage, mergeUsage, hasValidUsage, estimateUsage, logUsage, addBufferToUsage, filterUsageForFormat, COLORS } from "./usageTracking.js";
-import { parseSSELine, hasValuableContent, fixInvalidId, formatSSE } from "./streamHelpers.js";
+import { parseSSELine, hasValuableContent, fixInvalidId, formatSSE, buildStreamErrorBytes } from "./streamHelpers.js";
 import { getOpenAIResponsesEventName, isOpenAIResponsesTerminalEvent, formatIncompleteOpenAIResponsesStreamFailure } from "./responsesStreamHelpers.js";
 import { dbg, isDebugEnabled } from "./debugLog.js";
 
@@ -88,6 +88,7 @@ export function createSSEStream(options = {}) {
   let openAIResponsesDoneSent = false;
   let streamDoneSent = false;  // track duplicate [DONE] across transform + flush
   let finalized = false;
+  let upstreamFailure = null;
   let completionFlushTimer = null;
 
   // Usage/logging tail, callable from transform() as well as flush(): a client that
@@ -105,7 +106,9 @@ export function createSSEStream(options = {}) {
       if (isPassthrough) usage = finalUsage; else state.usage = finalUsage;
     }
 
-    if (hasValidUsage(finalUsage)) {
+    if (upstreamFailure) {
+      appendRequestLog({ model, provider, connectionId, tokens: null, status: `FAILED ${upstreamFailure.status}` }).catch(() => {});
+    } else if (hasValidUsage(finalUsage)) {
       logUsage(isPassthrough ? provider : (state?.provider || targetFormat), finalUsage, model, connectionId, apiKey);
     } else {
       appendRequestLog({ model, provider, connectionId, tokens: null, status: "200 OK" }).catch(() => { });
@@ -114,7 +117,8 @@ export function createSSEStream(options = {}) {
     if (onStreamComplete) {
       onStreamComplete({
         content: accumulatedContent,
-        thinking: accumulatedThinking
+        thinking: accumulatedThinking,
+        ...(upstreamFailure ? { error: upstreamFailure } : {})
       }, finalUsage, ttftAt);
     }
   };
@@ -272,6 +276,19 @@ export function createSSEStream(options = {}) {
 
         const parsed = parseSSELine(trimmed, targetFormat);
         if (!parsed) continue;
+        if (upstreamFailure) continue;
+        if (parsed.error && targetFormat === FORMATS.OPENAI) {
+          const code = Number(parsed.error.status);
+          upstreamFailure = { status: Number.isInteger(code) && code >= 400 && code <= 599 ? code : 502,
+            message: typeof parsed.error.message === 'string' ? parsed.error.message : 'Upstream stream failed' };
+          const failureBytes = sourceFormat === FORMATS.OPENAI_RESPONSES
+            ? sharedEncoder.encode(`event: error\ndata: ${JSON.stringify({ type: 'error', code: upstreamFailure.status === 429 ? 'rate_limit_exceeded' : 'server_error', message: upstreamFailure.message, sequence_number: 1 })}\n\n`)
+            : buildStreamErrorBytes(upstreamFailure.status, upstreamFailure.message, sourceFormat);
+          controller.enqueue(failureBytes);
+          streamDoneSent = true;
+          finalizeStream();
+          continue;
+        }
 
         // Responses API same-format passthrough: preserve event framing + track terminal state
         const isOpenAIResponsesStream = targetFormat === FORMATS.OPENAI_RESPONSES;
@@ -422,6 +439,7 @@ export function createSSEStream(options = {}) {
     },
 
     flush(controller) {
+      if (upstreamFailure) { finalizeStream(); return; }
       const evtSummary = Object.entries(eventTypeCounts).map(([k, v]) => `${k}=${v}`).join(",") || "none";
       dbg("SSE", `flush | provider=${provider} | model=${model} | recvLines=${sseLineCount} | emitted=${sseEmittedCount} | events=[${evtSummary}]`);
       trackPendingRequest(model, provider, connectionId, false);
